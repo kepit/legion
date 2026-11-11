@@ -3,7 +3,11 @@ defmodule Legion.AgentServer do
   GenServer that maintains conversation history for a long-lived agent.
 
   Holds the message history across multiple turns. Each `call` or `cast`
-  appends the user message and runs `Executor` to completion (blocking).
+  appends the user message and runs `Executor` to completion. Requests run
+  one at a time, in the order they arrive, each in a worker process linked to
+  the agent, so the agent stays free to cancel a running or queued call made
+  with a `:ref`, or tell the code it ran; see `Legion.cancel/2` and
+  `Legion.get_code/2`.
 
   When Legion starts an agent in resume or recovery mode, the server restores
   the persisted conversation and executor checkpoint, then continues it during
@@ -38,8 +42,17 @@ defmodule Legion.AgentServer do
     # Under `:turn` scope, what a resumed turn goes back to when it ends: the
     # bindings `Legion.eval/3` made outside any turn, as its checkpoint saved them.
     base_bindings: [],
-    idle_timer: nil
+    idle_timer: nil,
+    # Requests waiting for the one running in `running`, a worker process.
+    queue: :queue.new(),
+    running: nil,
+    # The code each finished or cancelled request with a `:ref` ran, by ref,
+    # as `{code, :ok | :error | :running}`.
+    codes: %{}
   ]
+
+  @cancelled_note "This request was cancelled before it finished. " <>
+                    "Do not continue it unless you are asked again."
 
   # Client API
 
@@ -118,8 +131,24 @@ defmodule Legion.AgentServer do
 
   defp check_store!(_rate_limit, _store, _track_usage), do: :ok
 
-  def call(agent, message, timeout \\ :infinity) do
-    GenServer.call(agent, {:message, message}, timeout)
+  def call(agent, message, opts \\ [])
+
+  def call(agent, message, opts) when is_list(opts) do
+    opts = Keyword.validate!(opts, [:ref, timeout: :infinity])
+    GenServer.call(agent, {:message, message, opts[:ref]}, opts[:timeout])
+  end
+
+  def call(agent, message, timeout), do: call(agent, message, timeout: timeout)
+
+  @doc false
+  def cancel(agent, ref) when not is_nil(ref) do
+    GenServer.call(agent, {:cancel, ref})
+  end
+
+  @doc false
+  def get_code(agent, ref, opts \\ []) when not is_nil(ref) do
+    opts = Keyword.validate!(opts, include_failed: true)
+    GenServer.call(agent, {:get_code, ref, opts})
   end
 
   def cast(agent, message) do
@@ -315,6 +344,12 @@ defmodule Legion.AgentServer do
 
   @impl true
   def terminate(_reason, state) do
+    # A worker is linked, but a :normal stop does not take it down.
+    if state.running do
+      Process.unlink(state.running.worker)
+      Process.exit(state.running.worker, :kill)
+    end
+
     Telemetry.emit(
       [:legion, :agent, :stopped],
       %{system_time: NaiveDateTime.utc_now()},
@@ -323,8 +358,8 @@ defmodule Legion.AgentServer do
   end
 
   @impl true
-  def handle_call(:get_messages, _from, state) do
-    {:reply, state.messages, reset_idle(state)}
+  def handle_call(:get_messages, from, state) do
+    {:noreply, enqueue(state, %{kind: :get_messages, from: from, ref: nil})}
   end
 
   @impl true
@@ -333,36 +368,254 @@ defmodule Legion.AgentServer do
   end
 
   @impl true
-  def handle_call({:message, message}, _from, state) do
-    {reply, state} = handle_message(message, state)
-    {:reply, reply, reset_idle(state)}
+  def handle_call({:message, message, ref}, from, state) do
+    {:noreply, enqueue(state, %{kind: :message, message: message, from: from, ref: ref})}
+  end
+
+  @impl true
+  def handle_call({:eval, code, opts}, from, state) do
+    {:noreply, enqueue(state, %{kind: :eval, code: code, opts: opts, from: from, ref: nil})}
+  end
+
+  @impl true
+  def handle_call({:cancel, ref}, _from, state) do
+    {cancelled, kept} = state.queue |> :queue.to_list() |> Enum.split_with(&(&1.ref == ref))
+    for job <- cancelled, do: reply(job, {:cancel, :cancelled})
+    state = %{state | queue: :queue.from_list(kept)}
+
+    {running_cancelled?, state} =
+      case state.running do
+        %{job: %{ref: ^ref}} -> {true, state |> cancel_running() |> run_next()}
+        _other -> {false, state}
+      end
+
+    reply = if running_cancelled? or cancelled != [], do: :ok, else: {:error, :not_found}
+    {:reply, reply, state}
+  end
+
+  # Answered at once, not queued: the latest request with `ref` is a waiting
+  # one, which ran nothing yet, the running one, or a finished one. Code still
+  # running, or cut short by a cancel, has not failed.
+  @impl true
+  def handle_call({:get_code, ref, opts}, _from, state) do
+    codes =
+      cond do
+        Enum.any?(:queue.to_list(state.queue), &(&1.ref == ref)) -> {:ok, []}
+        match?(%{job: %{ref: ^ref}}, state.running) -> {:ok, state.running.codes}
+        Map.has_key?(state.codes, ref) -> {:ok, Map.fetch!(state.codes, ref)}
+        true -> {:error, :not_found}
+      end
+
+    reply =
+      with {:ok, codes} <- codes do
+        {:ok, for({code, status} <- codes, opts[:include_failed] or status != :error, do: code)}
+      end
+
+    {:reply, reply, state}
+  end
+
+  @impl true
+  def handle_cast({:message, message}, state) do
+    {:noreply, enqueue(state, %{kind: :message, message: message, from: nil, ref: nil})}
+  end
+
+  # A tag no longer in the state is a timer a later call replaced. A busy
+  # agent is not idle; it starts the wait over once its queue is empty.
+  @impl true
+  def handle_info({:idle_timeout, tag}, %{idle_timer: {tag, _timer}, running: nil} = state),
+    do: {:stop, :normal, state}
+
+  def handle_info({:job_done, tag, {reply, worker_state}}, %{running: %{tag: tag}} = state) do
+    Process.demonitor(state.running.monitor, [:flush])
+    reply(state.running.job, reply)
+
+    state = %{
+      state
+      | running: nil,
+        codes: keep_codes(state.codes, state.running),
+        messages: worker_state.messages,
+        bindings: worker_state.bindings,
+        usage: worker_state.usage
+    }
+
+    {:noreply, run_next(state)}
+  end
+
+  def handle_info({:job_progress, tag, event}, %{running: %{tag: tag} = running} = state) do
+    {:noreply, %{state | running: progress(running, event)}}
+  end
+
+  # Results and progress of a cancelled worker carry a tag no longer running.
+  def handle_info(_message, state), do: {:noreply, state}
+
+  defp progress(running, {:checkpoint, checkpoint}),
+    do: %{running | checkpoint: checkpoint, turn_usage: checkpoint.turn_usage}
+
+  defp progress(running, {:usage, turn_usage}), do: %{running | turn_usage: turn_usage}
+  defp progress(running, {:code, {:started, code}}),
+    do: %{running | codes: running.codes ++ [{code, :running}]}
+
+  defp progress(running, {:code, {:finished, status}}),
+    do: %{running | codes: List.update_at(running.codes, -1, fn {code, _} -> {code, status} end)}
+
+  defp keep_codes(codes, %{job: %{ref: nil}}), do: codes
+  defp keep_codes(codes, %{job: %{ref: ref}, codes: ran}), do: Map.put(codes, ref, ran)
+
+  defp enqueue(state, job), do: run_next(%{state | queue: :queue.in(job, state.queue)})
+
+  defp run_next(%{running: nil} = state) do
+    case :queue.out(state.queue) do
+      {:empty, _queue} -> reset_idle(state)
+      {{:value, job}, queue} -> start_job(job, %{state | queue: queue})
+    end
+  end
+
+  defp run_next(state), do: state
+
+  defp start_job(%{kind: :get_messages} = job, state) do
+    reply(job, state.messages)
+    run_next(state)
   end
 
   # A call waits while the agent is busy. One whose caller gave up and died
   # meanwhile, as an MCP request does when it times out, is skipped: run now,
   # it would act for nobody, and the caller's retry would run it again.
-  @impl true
-  def handle_call({:eval, code, opts}, {caller, _tag}, state) do
+  defp start_job(%{kind: :eval, from: {caller, _tag}} = job, state) do
     if node(caller) == node() and not Process.alive?(caller) do
-      {:noreply, reset_idle(state)}
+      run_next(state)
     else
-      {reply, state} = handle_eval(code, opts, state)
-      {:reply, reply, reset_idle(state)}
+      spawn_job(job, state, fn state, _report -> handle_eval(job.code, job.opts, state) end)
     end
   end
 
-  @impl true
-  def handle_cast({:message, message}, state) do
-    {_reply, state} = handle_message(message, state)
-    {:noreply, reset_idle(state)}
+  defp start_job(%{kind: :message} = job, state) do
+    case begin_turn(job.message, state) do
+      {:ok, state} ->
+        spawn_job(job, state, &do_run(&1, :nonexistent, &2))
+
+      {:rate_limited, violations} ->
+        reply(job, {:cancel, {:rate_limited, violations}})
+        run_next(state)
+    end
   end
 
-  # A tag no longer in the state is a timer a later call replaced.
-  @impl true
-  def handle_info({:idle_timeout, tag}, %{idle_timer: {tag, _timer}} = state),
-    do: {:stop, :normal, state}
+  # The worker gets the agent's vault and callers, so tools, stubs and an
+  # Ecto sandbox connection reach it as they reach the agent.
+  defp spawn_job(job, state, fun) do
+    agent = self()
+    tag = make_ref()
+    vault = Vault.vault(propagate_vault: :none)
+    callers = [agent | Process.get(:"$callers", [])]
+    report = fn event -> send(agent, {:job_progress, tag, event}) end
 
-  def handle_info(_message, state), do: {:noreply, state}
+    worker =
+      spawn_link(fn ->
+        Process.put(:"$callers", callers)
+        Process.put(:__vault__, vault)
+        send(agent, {:job_done, tag, fun.(state, report)})
+      end)
+
+    running = %{
+      job: job,
+      tag: tag,
+      worker: worker,
+      monitor: Process.monitor(worker),
+      started_at: System.monotonic_time(),
+      turn_state: state,
+      sub_agents_before: if(job.kind == :message, do: turn_sub_agents(state)),
+      checkpoint: nil,
+      turn_usage: [],
+      codes: []
+    }
+
+    %{state | running: running}
+  end
+
+  defp reply(%{from: nil}, _reply), do: :ok
+  defp reply(%{from: from}, reply), do: GenServer.reply(from, reply)
+
+  # Unlinked first, so the kill does not reach the agent; the worker is gone
+  # before anything is saved, so none of its saves land after the agent's.
+  defp cancel_running(%{running: running} = state) do
+    Process.unlink(running.worker)
+    Process.exit(running.worker, :kill)
+
+    receive do
+      {:DOWN, ref, :process, _pid, _reason} when ref == running.monitor -> :ok
+    end
+
+    running = drain_progress(running)
+    reply(running.job, {:cancel, :cancelled})
+    state = %{state | running: nil, codes: keep_codes(state.codes, running)}
+    finish_cancelled_turn(state, running)
+  end
+
+  # What the worker sent before it died is already in the mailbox, ahead of
+  # its :DOWN, so no code or usage it reported is lost.
+  defp drain_progress(%{tag: tag} = running) do
+    receive do
+      {:job_progress, ^tag, event} -> running |> progress(event) |> drain_progress()
+    after
+      0 -> running
+    end
+  end
+
+  # Keeps the prompt and the steps the last checkpoint reached, and tells the
+  # model the request was dropped, so neither it nor `Legion.resume/2` picks
+  # it up again. The usage of every request already answered is kept too;
+  # one whose message was not kept names none.
+  defp finish_cancelled_turn(state, %{turn_state: turn} = running) do
+    {messages, bindings} =
+      case running.checkpoint do
+        nil -> {turn.messages, turn.bindings}
+        checkpoint -> {checkpoint.messages, checkpoint.bindings}
+      end
+
+    conversation_scope? = Map.get(state.config, :binding_scope, :turn) == :conversation
+
+    if running.sub_agents_before,
+      do: AgentTool.stop_running(state.agent_id, running.sub_agents_before)
+
+    kept_bindings = if conversation_scope?, do: bindings, else: turn.bindings
+    kept_count = length(messages)
+
+    turn_usage =
+      Enum.map(running.turn_usage, fn
+        %{"message_index" => index} = usage when is_integer(index) and index >= kept_count ->
+          %{usage | "message_index" => nil}
+
+        usage ->
+          usage
+      end)
+
+    usage = persisted_usage(state, turn_usage)
+
+    state = %{
+      state
+      | messages: messages ++ [Executor.message(:error, @cancelled_note)],
+        bindings: kept_bindings,
+        usage: usage
+    }
+
+    state = persist(state, [:conversation_state, status: :idle, usage: usage])
+
+    Telemetry.emit(
+      [:legion, :agent, :message, :stop],
+      %{duration: System.monotonic_time() - running.started_at},
+      %{
+        agent: state.agent_module,
+        message: turn.messages |> List.last() |> Map.get(:content),
+        iterations: count_assistant(messages) - count_assistant(turn.messages),
+        status: :cancel,
+        result: :cancelled,
+        bindings: kept_bindings
+      }
+    )
+
+    state
+  end
+
+  defp count_assistant(messages), do: Enum.count(messages, &(&1[:role] == "assistant"))
 
   # A tagged timer rather than a GenServer timeout: that one is reset by any
   # message, not only calls, and fired by a plain `:timeout` from anyone.
@@ -393,6 +646,13 @@ defmodule Legion.AgentServer do
     - anything else - rendered via `inspect/2`
   """
   def handle_message(message, state) do
+    case begin_turn(message, state) do
+      {:ok, state} -> do_run(state)
+      {:rate_limited, violations} -> {{:cancel, {:rate_limited, violations}}, state}
+    end
+  end
+
+  defp begin_turn(message, state) do
     case enforce_rate_limit(state) do
       :ok ->
         content = stringify(message, state.config[:max_message_length])
@@ -408,10 +668,10 @@ defmodule Legion.AgentServer do
             status: :running
           ])
 
-        do_run(state)
+        {:ok, state}
 
       {:rate_limited, violations} ->
-        {{:cancel, {:rate_limited, violations}}, state}
+        {:rate_limited, violations}
     end
   end
 
@@ -575,7 +835,9 @@ defmodule Legion.AgentServer do
     end
   end
 
-  defp do_run(state, executor_state \\ :nonexistent) do
+  # `report`, given when a worker runs the turn, tells the agent how far the
+  # turn got, so a cancelled one keeps its finished steps and their usage.
+  defp do_run(state, executor_state \\ :nonexistent, report \\ nil) do
     conversation_scope? = Map.get(state.config, :binding_scope, :turn) == :conversation
     # A resumed turn keeps the bindings its checkpoint saved, whatever the scope -
     # they belong to the turn being finished, not to a new one.
@@ -584,24 +846,31 @@ defmodule Legion.AgentServer do
     # What the turn goes back to when it ends, unless bindings outlive turns:
     # a new turn starts from it, a resumed turn's checkpoint saved it.
     base = if resuming?, do: state.base_bindings, else: state.bindings
+    step? = state.persistence_frequency == :step
 
     checkpoint =
-      if state.persistence_frequency == :step do
+      if step? or report do
         fn checkpoint ->
-          usage = persisted_usage(state, checkpoint.turn_usage)
-          checkpoint = Map.put(checkpoint, :base_bindings, base)
-          persist(state, [{:conversation_state, checkpoint}, usage: usage])
+          if step? do
+            usage = persisted_usage(state, checkpoint.turn_usage)
+            checkpoint = Map.put(checkpoint, :base_bindings, base)
+            persist(state, [{:conversation_state, checkpoint}, usage: usage])
+          end
+
+          if report, do: report.({:checkpoint, checkpoint})
           :ok
         end
       end
 
-    executor_config = Map.put(state.config, :checkpoint, checkpoint)
+    executor_config =
+      state.config
+      |> Map.put(:checkpoint, checkpoint)
+      |> Map.put(:report_usage, report && fn turn_usage -> report.({:usage, turn_usage}) end)
+      |> Map.put(:report_code, report && fn code -> report.({:code, code}) end)
 
     # Unless bindings outlive the turn, the ids of the sub-agents it starts
     # go with them at its end, and so do the sub-agents.
-    sub_agents_before =
-      if not conversation_scope? and AgentTool in state.agent_module.tools(),
-        do: AgentTool.running(state.agent_id)
+    sub_agents_before = turn_sub_agents(state)
 
     {status, value, final_messages, final_bindings, turn_usage} =
       Telemetry.span(
@@ -651,6 +920,12 @@ defmodule Legion.AgentServer do
     state = persist(state, fields)
 
     {{status, value}, state}
+  end
+
+  defp turn_sub_agents(state) do
+    if Map.get(state.config, :binding_scope, :turn) != :conversation and
+         AgentTool in state.agent_module.tools(),
+       do: AgentTool.running(state.agent_id)
   end
 
   defp persist(state, fields) do

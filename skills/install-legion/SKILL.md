@@ -384,7 +384,16 @@ Then the call, by entry point:
   def handle_async(:reply, {:ok, {:cancel, reason}}, socket), do: ...
   ```
 
-  The reply goes where the pane shows messages today.
+  The reply goes where the pane shows messages today. If the pane has a stop
+  button, pass a ref and cancel with it; the call then returns
+  `{:cancel, :cancelled}` to the `handle_async` above:
+
+  ```elixir
+  ref = make_ref()
+  start_async(socket, :reply, fn -> Legion.call(pid, question, ref: ref) end)
+  # assign the ref, then in the stop button's handle_event:
+  Legion.cancel(socket.assigns.agent, socket.assigns.reply_ref)
+  ```
 - Controller action or webhook: no `start_link`. `Legion.execute/3` starts
   the agent, runs one turn and stops it, so nothing outlives the request: a
   linked agent would, since a request process exits normally. It takes the

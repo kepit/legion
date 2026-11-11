@@ -160,14 +160,89 @@ defmodule Legion do
   @doc """
   Sends a message to a running agent and waits for the result.
 
+  The third argument is a timeout, or a keyword list of options:
+
+    - `:timeout` - how long to wait, in milliseconds (default: `:infinity`)
+    - `:ref` - any term other than `nil` naming this request, so
+      `cancel/2` can stop it and `get_code/2` can tell the code it ran;
+      `make_ref/0` gives one no other request has
+
   ## Examples
 
       {:ok, pid} = Legion.start_link(AssistantAgent)
       {:ok, answer} = Legion.call(pid, "What is the capital of France?")
-      {:ok, follow_up} = Legion.call(pid, "And its population?")
+      {:ok, follow_up} = Legion.call(pid, "And its population?", 30_000)
+
+      ref = make_ref()
+      task = Task.async(fn -> Legion.call(pid, "Write a long report", ref: ref) end)
+      :ok = Legion.cancel(pid, ref)
+      {:cancel, :cancelled} = Task.await(task)
   """
-  def call(pid, message, timeout \\ :infinity) do
-    AgentServer.call(pid, message, timeout)
+  def call(pid, message, timeout_or_opts \\ :infinity) do
+    AgentServer.call(pid, message, timeout_or_opts)
+  end
+
+  @doc """
+  Cancels the request made with `call/3` under `ref`, whether it is running
+  or still waiting for the agent. Its caller gets `{:cancel, :cancelled}`;
+  the agent keeps running and goes on with the requests after it.
+
+  A request still waiting is dropped and leaves no trace. A running one is
+  stopped at once, mid-LLM request or mid-evaluation. The conversation keeps
+  its prompt and the steps it finished, up to its last code result or error,
+  followed by a note telling the model that the request was cancelled, and
+  the usage of every LLM request already answered counts. The effects of
+  code that already ran, a tool's write or a sub-agent's work, are not undone.
+
+  Returns `:ok`, or `{:error, :not_found}` when no request of the agent
+  has that `ref`, such as one already finished. Every request with that
+  `ref` is cancelled.
+
+  ## Examples
+
+      ref = make_ref()
+      task = Task.async(fn -> Legion.call(pid, "Summarize the backlog", ref: ref) end)
+
+      :ok = Legion.cancel(pid, ref)
+      {:cancel, :cancelled} = Task.await(task)
+
+      {:error, :not_found} = Legion.cancel(pid, ref)
+  """
+  def cancel(pid, ref) when not is_nil(ref) do
+    AgentServer.cancel(pid, ref)
+  end
+
+  @doc """
+  Returns the code the agent ran for the request made with `call/3` under
+  `ref`, in the order it ran.
+
+  Every evaluation is listed, including one that failed or raised, and one
+  still running. The agent answers at once, even while the request runs, so
+  the list of a running request holds what it ran so far; one still waiting
+  for the agent has run nothing, `{:ok, []}`. The code of a finished or
+  cancelled request is kept as long as the agent runs, under its `ref`.
+  When several requests share a `ref`, the latest one is answered.
+
+  ## Options
+
+    - `:include_failed` - when `false`, leaves out code that failed to
+      check, raised or hit a sandbox limit (default: `true`). Code still
+      running, or stopped by `cancel/2` mid-run, has not failed and is kept
+
+  Returns `{:ok, [code]}`, or `{:error, :not_found}` when no request of
+  the agent has that `ref`.
+
+  ## Examples
+
+      ref = make_ref()
+      {:ok, _answer} = Legion.call(pid, "Sum the numbers 1 to 10", ref: ref)
+      {:ok, ["return Enum.sum(1..10)"]} = Legion.get_code(pid, ref)
+      {:ok, ["return Enum.sum(1..10)"]} = Legion.get_code(pid, ref, include_failed: false)
+
+      {:error, :not_found} = Legion.get_code(pid, make_ref())
+  """
+  def get_code(pid, ref, opts \\ []) when not is_nil(ref) do
+    AgentServer.get_code(pid, ref, opts)
   end
 
   @doc """

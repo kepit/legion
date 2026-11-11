@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Changes
+
+- [`Legion.cancel/2`](https://hexdocs.pm/legion/Legion.html#cancel/2) cancels a request made with `Legion.call(pid, message, ref: ref)`, running or queued; its caller gets `{:cancel, :cancelled}` and the agent goes on with the next request. A cancelled turn keeps its prompt and finished steps, followed by an `:error` message telling the model it was cancelled, and its usage counts
+- An agent runs each request in a worker process linked to it, so it can answer a cancellation mid-turn; code that compared the process running a turn, such as an LLM stub's `self()`, with the agent's pid now sees the worker
+- [`Legion.get_code/2`](https://hexdocs.pm/legion/Legion.html#get_code/2) returns the code an agent ran for the request made with `ref: ref`, in order and failed runs included unless `include_failed: false` is passed; a running request answers with what it ran so far, and finished or cancelled requests keep theirs while the agent runs
+
 ## v0.6.0 - 2026-10-13
 
 ### Highlights

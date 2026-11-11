@@ -30,6 +30,8 @@ defmodule Legion.Telemetry do
       `status` (`:ok` or `:cancel`), `result` (the value returned, or the
       cancellation reason such as `:reached_max_iterations`), and `bindings`
       (the variable bindings carried out of the turn)
+    - A turn stopped by `Legion.cancel/2` emits no `:exception`; its agent
+      emits `:stop` with `status: :cancel` and `result: :cancelled`
 
   ## Iteration Events (spans)
 

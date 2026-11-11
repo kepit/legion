@@ -179,6 +179,8 @@ defmodule Legion.Executor do
         error -> {:error, error, turn_usage}
       end
 
+    report_usage(config, elem(llm_result, tuple_size(llm_result) - 1))
+
     case llm_result do
       {:ok, action, messages, turn_usage} ->
         case validate_action_type(agent_module, action) do
@@ -287,6 +289,24 @@ defmodule Legion.Executor do
   defp normalize_usage_key(key) when is_atom(key), do: Atom.to_string(key)
   defp normalize_usage_key(key), do: key
 
+  # Lets the agent count what a turn spent even if it is cancelled before
+  # its next checkpoint.
+  defp report_usage(config, turn_usage) do
+    case config[:report_usage] do
+      nil -> :ok
+      report -> report.(turn_usage)
+    end
+  end
+
+  # Tells the agent which code its turn runs, `{:started, code}`, and how
+  # each run ended, `{:finished, :ok | :error}`.
+  defp report_code(config, event) do
+    case config[:report_code] do
+      nil -> :ok
+      report -> report.(event)
+    end
+  end
+
   defp checkpoint!(config, messages, bindings, executor_state, turn_usage) do
     case config[:checkpoint] do
       nil ->
@@ -349,8 +369,12 @@ defmodule Legion.Executor do
     # Flags the request whose action ran code: this is what `:max_evals`
     # counts. Set before the run so a failed evaluation counts too.
     turn_usage = List.update_at(turn_usage, -1, &Map.put(&1, "evals", 1))
+    report_usage(config, turn_usage)
+    report_code(config, {:started, code})
+    run = Eval.run(agent, code, config, bindings)
+    report_code(config, {:finished, elem(run, 0)})
 
-    case Eval.run(agent, code, config, bindings) do
+    case run do
       {:ok, {result, new_bindings}} ->
         new_bindings = if config.binding_scope == :iteration, do: [], else: new_bindings
 

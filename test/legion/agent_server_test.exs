@@ -307,6 +307,26 @@ defmodule Legion.AgentServerTest do
     end
   end
 
+  # Answers each LLM request with the next response, after telling the test
+  # it started; a `:block` entry waits until the request is cancelled.
+  defp script_llm(responses) do
+    test_pid = self()
+    {:ok, script} = Agent.start_link(fn -> responses end)
+
+    stub(ReqLLM, :generate_object, fn _model, messages, _schema ->
+      send(test_pid, {:llm_request, self(), messages})
+
+      case Agent.get_and_update(script, fn [next | rest] -> {next, rest} end) do
+        :block -> Process.sleep(:infinity)
+        response -> response
+      end
+    end)
+  end
+
+  defp async_call(pid, message, ref) do
+    Task.async(fn -> Legion.call(pid, message, ref: ref) end)
+  end
+
   describe "get_messages/1" do
     test "returns conversation history from a running agent" do
       stub(ReqLLM, :generate_object, fn _model, _messages, _schema ->
@@ -488,14 +508,189 @@ defmodule Legion.AgentServerTest do
 
       pid = start_agent(MathAgent)
       assert :ok = Legion.cast(pid, "What is the capital of France?")
-      assert_receive {:turn_started, ^pid}
-      send(pid, :finish)
+      assert_receive {:turn_started, worker}
+      send(worker, :finish)
 
       assert [
                %{role: "system"},
                %{role: "user", content: "What is the capital of France?"},
                %{role: "assistant"} | _
              ] = Legion.get_messages(pid)
+    end
+  end
+
+  describe "cancel/2" do
+    setup do
+      start_supervised!(%{id: MemoryStore, start: {MemoryStore, :start_link, []}})
+      :ok
+    end
+
+    test "stops a running call, which returns {:cancel, :cancelled}, and keeps the agent",
+         %{agent_id: agent_id} do
+      script_llm([:block, llm_response("second")])
+      pid = start_agent(MathAgent, store: MemoryStore, agent_id: agent_id)
+      ref = make_ref()
+
+      task = async_call(pid, "first", ref)
+      assert_receive {:llm_request, worker, _messages}
+      worker_ref = Process.monitor(worker)
+
+      assert :ok = Legion.cancel(pid, ref)
+      assert {:cancel, :cancelled} = Task.await(task)
+      assert_receive {:DOWN, ^worker_ref, :process, ^worker, :killed}
+      assert Process.alive?(pid)
+
+      assert [
+               %{role: "system"},
+               %{type: :user, content: "first"},
+               %{type: :error, content: "This request was cancelled" <> _}
+             ] = Legion.get_messages(pid)
+
+      assert MemoryStore.statuses(agent_id) == [:running, :idle]
+      assert {:ok, %{executor_state: :nonexistent}} = MemoryStore.load(agent_id)
+
+      assert {:ok, "second"} = Legion.call(pid, "second")
+      assert {:error, :not_found} = Legion.cancel(pid, ref)
+    end
+
+    test "keeps the steps a cancelled turn finished, with their usage", %{agent_id: agent_id} do
+      script_llm([llm_eval_continue_response("return 1 + 1", 7), :block])
+      pid = start_agent(MathAgent, store: MemoryStore, agent_id: agent_id)
+      ref = make_ref()
+
+      task = async_call(pid, "compute", ref)
+      assert_receive {:llm_request, _worker, _messages}
+      assert_receive {:llm_request, _worker, _messages}
+
+      assert :ok = Legion.cancel(pid, ref)
+      assert {:cancel, :cancelled} = Task.await(task)
+
+      assert {:ok, %Payload{status: :idle, usage: usage, conversation_state: state}} =
+               MemoryStore.get(agent_id)
+
+      assert Enum.map(state.messages, & &1.type) == [:user, :assistant, :eval_result, :error]
+      assert [%{"turn_usage" => 7, "evals" => 1, "message_index" => 1}] = usage
+    end
+
+    test "counts the usage of an answered request whose step it does not keep",
+         %{agent_id: agent_id} do
+      script_llm([llm_eval_continue_response("while true do end", 5)])
+      pid = start_agent(MathAgent, store: MemoryStore, agent_id: agent_id)
+      ref = make_ref()
+
+      task = async_call(pid, "compute", ref)
+
+      # The request that ran code reports its usage before the code starts.
+      wait_until(fn ->
+        match?(%{running: %{turn_usage: [%{"evals" => 1}]}}, :sys.get_state(pid))
+      end)
+
+      assert :ok = Legion.cancel(pid, ref)
+      assert {:cancel, :cancelled} = Task.await(task)
+
+      assert {:ok, %Payload{usage: usage, conversation_state: state}} = MemoryStore.get(agent_id)
+      assert Enum.map(state.messages, & &1.type) == [:user, :error]
+      assert [%{"turn_usage" => 5, "evals" => 1, "message_index" => nil}] = usage
+    end
+
+    test "drops a queued call and leaves the running one and the rest alone" do
+      script_llm([:block, llm_response("third")])
+      pid = start_agent(MathAgent)
+      [first_ref, second_ref, third_ref] = for _ <- 1..3, do: make_ref()
+
+      first = async_call(pid, "first", first_ref)
+      assert_receive {:llm_request, _worker, _messages}
+      second = async_call(pid, "second", second_ref)
+      third = async_call(pid, "third", third_ref)
+      wait_until(fn -> :queue.len(:sys.get_state(pid).queue) == 2 end)
+
+      assert :ok = Legion.cancel(pid, second_ref)
+      assert {:cancel, :cancelled} = Task.await(second)
+      assert :sys.get_state(pid).running.job.ref == first_ref
+
+      assert :ok = Legion.cancel(pid, first_ref)
+      assert {:cancel, :cancelled} = Task.await(first)
+      assert {:ok, "third"} = Task.await(third)
+
+      assert_receive {:llm_request, _worker, messages}
+      refute Enum.any?(messages, &(&1[:content] == "second"))
+    end
+
+    test "returns {:error, :not_found} for a ref no request has" do
+      pid = start_agent(MathAgent)
+
+      assert {:error, :not_found} = Legion.cancel(pid, make_ref())
+    end
+
+    test "a call keeps taking a timeout as its third argument" do
+      script_llm([llm_response("ok")])
+      pid = start_agent(MathAgent)
+
+      assert {:ok, "ok"} = Legion.call(pid, "hi", 5_000)
+      assert_raise ArgumentError, fn -> Legion.call(pid, "hi", bogus: true) end
+    end
+  end
+
+  describe "get_code/2" do
+    test "returns the code a finished call ran, failed runs included" do
+      script_llm([
+        llm_eval_continue_response("return 1 + 1"),
+        llm_eval_continue_response("return ("),
+        llm_response("done")
+      ])
+
+      pid = start_agent(MathAgent)
+      ref = make_ref()
+
+      assert {:ok, "done"} = Legion.call(pid, "compute", ref: ref)
+      assert {:ok, ["return 1 + 1", "return ("]} = Legion.get_code(pid, ref)
+      assert {:ok, ["return 1 + 1"]} = Legion.get_code(pid, ref, include_failed: false)
+      assert_raise ArgumentError, fn -> Legion.get_code(pid, ref, bogus: true) end
+    end
+
+    test "include_failed: false keeps code a cancel cut short" do
+      script_llm([llm_eval_continue_response("while true do end")])
+      pid = start_agent(MathAgent)
+      ref = make_ref()
+
+      task = async_call(pid, "compute", ref)
+      wait_until(fn -> match?({:ok, [_]}, Legion.get_code(pid, ref)) end)
+
+      assert :ok = Legion.cancel(pid, ref)
+      assert {:cancel, :cancelled} = Task.await(task)
+      assert {:ok, ["while true do end"]} = Legion.get_code(pid, ref, include_failed: false)
+    end
+
+    test "answers while the call runs, for a queued call, and after a cancel" do
+      script_llm([llm_eval_continue_response("return 1 + 1"), :block])
+      pid = start_agent(MathAgent)
+      [ref, queued_ref] = [make_ref(), make_ref()]
+
+      task = async_call(pid, "compute", ref)
+      assert_receive {:llm_request, _worker, _messages}
+      assert_receive {:llm_request, _worker, _messages}
+      queued = async_call(pid, "later", queued_ref)
+      wait_until(fn -> :queue.len(:sys.get_state(pid).queue) == 1 end)
+
+      assert {:ok, ["return 1 + 1"]} = Legion.get_code(pid, ref)
+      assert {:ok, []} = Legion.get_code(pid, queued_ref)
+
+      assert :ok = Legion.cancel(pid, queued_ref)
+      assert {:cancel, :cancelled} = Task.await(queued)
+      assert :ok = Legion.cancel(pid, ref)
+      assert {:cancel, :cancelled} = Task.await(task)
+
+      assert {:ok, ["return 1 + 1"]} = Legion.get_code(pid, ref)
+    end
+
+    test "returns {:error, :not_found} for a ref no request has" do
+      script_llm([llm_eval_response("return 1")])
+      pid = start_agent(MathAgent)
+
+      assert {:ok, _} = Legion.call(pid, "compute")
+      assert {:error, :not_found} = Legion.get_code(pid, make_ref())
+      assert %{codes: codes} = :sys.get_state(pid)
+      assert codes == %{}
     end
   end
 
