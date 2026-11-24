@@ -200,6 +200,20 @@ defmodule Legion.ExecutorTest do
                Executor.run(MathAgent, executor_messages("fail once"), %{})
     end
 
+    test "passes llm_opts to ReqLLM" do
+      llm_opts = [provider_options: [google_thinking_level: :medium]]
+
+      stub(ReqLLM, :generate_object, fn _model, _messages, _schema, opts ->
+        send(self(), {:llm_opts, opts})
+        response(%{"action" => "return", "code" => "", "result" => "42"})
+      end)
+
+      assert {:ok, "42", _messages, [], [_usage]} =
+               Executor.run(MathAgent, executor_messages("what is 42?"), %{llm_opts: llm_opts})
+
+      assert_received {:llm_opts, ^llm_opts}
+    end
+
     test "emits normalized usage in LLM request stop telemetry" do
       attach_llm_request_stop()
 

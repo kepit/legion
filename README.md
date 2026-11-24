@@ -142,7 +142,7 @@ config :legion, :config, %{model: "openai:gpt-5.6-luna", max_iterations: 10}
 def config, do: %{model: "google:gemini-3.5-flash", max_iterations: 5}
 ```
 
-`model` is a `provider:model` string, and any [ReqLLM](https://hexdocs.pm/req_llm) provider works, [local models](https://hexdocs.pm/legion/local_llms.html) included. See [`Legion.Agent`](https://hexdocs.pm/legion/Legion.Agent.html) for the other options and callbacks, like `system_prompt/0` and `output_schema/0` (structured output).
+`model` is a `provider:model` string, and any [ReqLLM](https://hexdocs.pm/req_llm) provider works, [local models](https://hexdocs.pm/legion/local_llms.html) included. `llm_opts` passes extra options to every ReqLLM request, e.g. `%{llm_opts: [provider_options: [google_thinking_level: :medium]]}`. See [`Legion.Agent`](https://hexdocs.pm/legion/Legion.Agent.html) for the other options and callbacks, like `system_prompt/0` and `output_schema/0` (structured output).
 
 ## Guides
 

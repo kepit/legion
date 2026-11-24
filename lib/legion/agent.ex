@@ -43,6 +43,9 @@ defmodule Legion.Agent do
     - `config/0` - agent-level configuration merged with application config and
       call-time opts. Defaults to `%{}`. Available keys:
       - `model` - LLM model identifier (default: `"openai:gpt-5.6-luna"`)
+      - `llm_opts` - keyword list of extra options passed to
+        `ReqLLM.generate_object/4` on every agent LLM request, e.g.
+        `[provider_options: [google_thinking_level: :medium]]` (default: `[]`)
       - `sandbox` - a `Legion.Sandbox` module that validates and evaluates the
         code the agent writes. `Legion.Sandbox.Lua` (the default) evaluates Lua
         in a pure-Elixir VM where only bridged tool functions can reach the
@@ -160,7 +163,7 @@ defmodule Legion.Agent do
     sub_agent_idle_timeout: 1
   ]
 
-  @known_config_keys ~w(binding_scope eval_guard idle_timeout max_bindings_bytes max_iterations max_message_length max_retries max_sub_agents model sandbox sandbox_max_heap sandbox_max_reductions sandbox_priority sandbox_timeout start_mode sub_agent_idle_timeout tool_docs)a
+  @known_config_keys ~w(binding_scope eval_guard idle_timeout llm_opts max_bindings_bytes max_iterations max_message_length max_retries max_sub_agents model sandbox sandbox_max_heap sandbox_max_reductions sandbox_priority sandbox_timeout start_mode sub_agent_idle_timeout tool_docs)a
 
   @doc false
   # Resolves the effective config for `agent_module`: Executor defaults, then the

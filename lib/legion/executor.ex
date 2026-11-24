@@ -244,7 +244,7 @@ defmodule Legion.Executor do
         iteration: iteration
       },
       fn ->
-        case ReqLLM.generate_object(config.model, messages, action_schema(agent_module, config)) do
+        case generate_object(config, messages, action_schema(agent_module, config)) do
           {:ok, response} ->
             handle_llm_response(response, messages, message_count, turn_usage)
 
@@ -253,6 +253,14 @@ defmodule Legion.Executor do
         end
       end
     )
+  end
+
+  # Keeps the 3-arity call when no `llm_opts` are set.
+  defp generate_object(config, messages, schema) do
+    case Map.get(config, :llm_opts, []) do
+      [] -> ReqLLM.generate_object(config.model, messages, schema)
+      opts -> ReqLLM.generate_object(config.model, messages, schema, opts)
+    end
   end
 
   defp handle_llm_response(response, messages, message_count, turn_usage) do
